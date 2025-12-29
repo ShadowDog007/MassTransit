@@ -4,6 +4,7 @@ namespace MassTransit.Middleware
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
+    using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
     using DependencyInjection;
@@ -84,63 +85,85 @@ namespace MassTransit.Middleware
             List<OutboxMessageContext> messages = await context.LoadOutboxMessages().ConfigureAwait(false);
 
             var messageLimit = _options.MessageDeliveryLimit;
-            var messageCount = 0;
             var messageIndex = 0;
-            for (; messageIndex < messages.Count && messageCount < messageLimit; messageIndex++)
+
+            if (_options.ConcurrentMessageDelivery)
             {
-                var message = messages[messageIndex];
-
-                if (context.LastSequenceNumber != null && context.LastSequenceNumber >= message.SequenceNumber)
+                var deliveryResults = await Task.WhenAll(messages.Take(messageLimit)
+                    .Select(message => DeliverOutboxMessage(context, message))
+                    .ToArray()).ConfigureAwait(false);
+                var lastSuccessfulDeliveryIndex = Array.LastIndexOf(deliveryResults, true);
+                if (lastSuccessfulDeliveryIndex != -1)
+                    await context.NotifyOutboxMessageDelivered(messages[lastSuccessfulDeliveryIndex]).ConfigureAwait(false);
+                messageIndex = Math.Min(messages.Count, messageLimit);
+            }
+            else
+            {
+                var messageCount = 0;
+                for (; messageIndex < messages.Count && messageCount < messageLimit; messageIndex++)
                 {
-                }
-                else if (message.DestinationAddress == null)
-                {
-                    LogContext.Warning?.Log("Outbox message DestinationAddress not present: {SequenceNumber} {MessageId}", message.SequenceNumber,
-                        message.MessageId);
-                }
-                else
-                {
-                    using var sendToken = new CancellationTokenSource(_options.MessageDeliveryTimeout);
-                    using var token = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken, sendToken.Token);
-
-                    var pipe = new OutboxMessageSendPipe(message, message.DestinationAddress);
-
-                    var endpoint = await context.CapturedContext.GetSendEndpoint(message.DestinationAddress).ConfigureAwait(false);
-
-                    var failDelivery = context.GetRetryAttempt() == 0 && (message.Headers.Get<bool>("MT-Fail-Delivery") ?? false);
-                    if (failDelivery)
-                        throw new ApplicationException("Simulated Delivery Failure Requested");
-
-                    StartedActivity? activity = LogContext.Current?.StartOutboxDeliverActivity(message);
-                    StartedInstrument? instrument = LogContext.Current?.StartOutboxDeliveryInstrument(context, message);
-                    try
+                    var message = messages[messageIndex];
+                    if (await DeliverOutboxMessage(context, message).ConfigureAwait(false))
                     {
-                        await endpoint.Send(new SerializedMessageBody(), pipe, token.Token).ConfigureAwait(false);
+                        await context.NotifyOutboxMessageDelivered(message).ConfigureAwait(false);
+                        messageCount++;
                     }
-                    catch (Exception exception)
-                    {
-                        activity?.AddExceptionEvent(exception);
-                        instrument?.AddException(exception);
-
-                        throw;
-                    }
-                    finally
-                    {
-                        activity?.Stop();
-                        instrument?.Stop();
-                    }
-
-                    LogContext.Debug?.Log("Outbox Sent: {InboxMessageId} {SequenceNumber} {MessageId}", context.MessageId, message.SequenceNumber,
-                        message.MessageId);
-
-                    await context.NotifyOutboxMessageDelivered(message).ConfigureAwait(false);
-
-                    messageCount++;
                 }
             }
 
             if (messageIndex == messages.Count && messages.Count < messageLimit)
                 await context.SetDelivered().ConfigureAwait(false);
+        }
+
+        async Task<bool> DeliverOutboxMessage(OutboxConsumeContext context, OutboxMessageContext message)
+        {
+            if (context.LastSequenceNumber != null && context.LastSequenceNumber >= message.SequenceNumber)
+            {
+            }
+            else if (message.DestinationAddress == null)
+            {
+                LogContext.Warning?.Log("Outbox message DestinationAddress not present: {SequenceNumber} {MessageId}", message.SequenceNumber,
+                    message.MessageId);
+            }
+            else
+            {
+                using var sendToken = new CancellationTokenSource(_options.MessageDeliveryTimeout);
+                using var token = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken, sendToken.Token);
+
+                var pipe = new OutboxMessageSendPipe(message, message.DestinationAddress);
+
+                var endpoint = await context.CapturedContext.GetSendEndpoint(message.DestinationAddress).ConfigureAwait(false);
+
+                var failDelivery = context.GetRetryAttempt() == 0 && (message.Headers.Get<bool>("MT-Fail-Delivery") ?? false);
+                if (failDelivery)
+                    throw new ApplicationException("Simulated Delivery Failure Requested");
+
+                StartedActivity? activity = LogContext.Current?.StartOutboxDeliverActivity(message);
+                StartedInstrument? instrument = LogContext.Current?.StartOutboxDeliveryInstrument(context, message);
+                try
+                {
+                    await endpoint.Send(new SerializedMessageBody(), pipe, token.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    activity?.AddExceptionEvent(exception);
+                    instrument?.AddException(exception);
+
+                    throw;
+                }
+                finally
+                {
+                    activity?.Stop();
+                    instrument?.Stop();
+                }
+
+                LogContext.Debug?.Log("Outbox Sent: {InboxMessageId} {SequenceNumber} {MessageId}", context.MessageId, message.SequenceNumber,
+                    message.MessageId);
+
+                return true;
+            }
+
+            return false;
         }
     }
 }

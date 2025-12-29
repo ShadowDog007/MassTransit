@@ -74,6 +74,7 @@ namespace MassTransit.Configuration
 
         public int MessageDeliveryLimit { get; set; } = 1;
         public TimeSpan MessageDeliveryTimeout { get; set; } = TimeSpan.FromSeconds(10);
+        public bool ConcurrentMessageDelivery { get; set; }
 
         public void SagaConfigured<TSaga>(ISagaConfigurator<TSaga> configurator)
             where TSaga : class, ISaga
@@ -106,7 +107,8 @@ namespace MassTransit.Configuration
                 ConsumerId = JobMetadataCache<T, TMessage>.GenerateJobTypeId(_configurator.InputAddress.GetEndpointName()),
                 ConsumerType = TypeMetadataCache<T>.ShortName,
                 MessageDeliveryLimit = MessageDeliveryLimit,
-                MessageDeliveryTimeout = MessageDeliveryTimeout
+                MessageDeliveryTimeout = MessageDeliveryTimeout,
+                ConcurrentMessageDelivery = ConcurrentMessageDelivery
             };
 
             var filter = new OutboxConsumeFilter<TContext, TMessage>(scopeProvider, options);
